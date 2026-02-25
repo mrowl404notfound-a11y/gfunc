@@ -1,0 +1,1055 @@
+#!/usr/bin/env python3
+"""
+gfunc v2 - Universal Function Call Graph Tool
+==============================================
+Fast, accurate function search across Solidity, Rust, Move, and Go.
+
+Uses ripgrep for speed + smart parsing for accuracy.
+Properly handles module::func(), contract.func(), Self::func() patterns.
+
+Usage:
+    gfunc <name> [path]                # Find definitions + callers
+    gfunc --callers-of <name> [path]   # Who calls this function
+    gfunc --callees-of <name> [path]   # What this function calls
+    gfunc --xrefs <name> [path]        # Callers + callees combined
+    gfunc --slice <name> [path]        # Full function slice with deps
+    gfunc --exact / -e                 # Exact name match
+    gfunc --lang solidity              # Force language
+    gfunc --json                       # JSON output
+    gfunc --include-tests / -t         # Include test files
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+
+class C:
+    RST = "\033[0m"
+    B   = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GRN = "\033[92m"
+    YEL = "\033[93m"
+    BLU = "\033[94m"
+    MAG = "\033[95m"
+    CYN = "\033[96m"
+    GRY = "\033[90m"
+
+    @classmethod
+    def off(cls):
+        for a in ['RST','B','DIM','RED','GRN','YEL','BLU','MAG','CYN','GRY']:
+            setattr(cls, a, "")
+
+# ── Language Definitions ─────────────────────────────────────────────────────
+
+LANGS = {
+    "move": {
+        "ext": {".move"},
+        "syn": "move",
+        # fun, public fun, public(friend) fun, entry fun, public entry fun
+        "def": re.compile(
+            r"(?:public\s*(?:\([^)]*\)\s*)?)?(?:entry\s+)?fun\s+(\w+)\s*[<(]"
+        ),
+        # module::func( pattern
+        "qcall": re.compile(r"(\w+)::(\w+)\s*[<(]"),
+        # bare func( pattern
+        "call": re.compile(r"\b(\w+)\s*[<(]\s*(?![^)]*\bfun\b)"),
+        "struct": re.compile(r"(?:public\s+)?struct\s+(\w+)"),
+        "module": re.compile(r"module\s+[\w:]+::(\w+)\s*\{"),
+        "skip": {"if","else","while","loop","return","let","mut","public","fun",
+                 "entry","struct","module","use","has","abort","assert","vector",
+                 "option","type_name","table","bag","true","false","move","copy",
+                 "borrow","borrow_mut","freeze","friend","const","spec","schema",
+                 "native","acquires","phantom","drop","store","key"},
+        "cmt1": "//", "cmtS": "/*", "cmtE": "*/",
+        "str_delim": {'"'},
+    },
+    "solidity": {
+        "ext": {".sol"},
+        "syn": "solidity",
+        "def": re.compile(
+            r"(?:function|modifier|constructor)\s+(\w+)\s*\("
+        ),
+        "qcall": re.compile(r"(\w+)\.(\w+)\s*\("),
+        "call": re.compile(r"\b(\w+)\s*\("),
+        "struct": re.compile(r"(?:struct|enum)\s+(\w+)"),
+        "module": None,
+        "skip": {"if","else","for","while","require","assert","revert","emit",
+                 "return","new","delete","type","using","super","this","msg",
+                 "block","tx","abi","keccak256","ecrecover","sha256","address",
+                 "uint256","uint128","uint64","uint32","uint8","int256","bool",
+                 "bytes","bytes32","string","mapping","memory","storage","calldata",
+                 "true","false","payable","event","error","indexed"},
+        "cmt1": "//", "cmtS": "/*", "cmtE": "*/",
+        "str_delim": {'"', "'"},
+    },
+    "rust": {
+        "ext": {".rs"},
+        "syn": "rust",
+        "def": re.compile(
+            r"(?:pub\s*(?:\([^)]*\)\s*)?)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*[<(]"
+        ),
+        "qcall": re.compile(r"(\w+)::(\w+)\s*[<(]"),
+        "call": re.compile(r"\b(\w+)\s*[!]?\s*\("),
+        "struct": re.compile(r"(?:pub\s+)?(?:struct|enum|trait|type)\s+(\w+)"),
+        "module": re.compile(r"mod\s+(\w+)\s*\{"),
+        "skip": {"if","else","for","while","match","loop","return","let","mut",
+                 "pub","fn","impl","struct","enum","trait","use","mod","async",
+                 "await","unsafe","where","self","Self","super","crate","as",
+                 "move","ref","type","const","static","extern","dyn","macro_rules",
+                 "Ok","Err","Some","None","vec","println","eprintln","format",
+                 "write","writeln","panic","unreachable","todo","unimplemented",
+                 "assert","assert_eq","assert_ne","debug_assert","cfg","test",
+                 "derive","allow","deny","true","false","Box","Vec","String",
+                 "Option","Result","Arc","Rc","Mutex","HashMap","HashSet",
+                 "BTreeMap","PhantomData"},
+        "cmt1": "//", "cmtS": "/*", "cmtE": "*/",
+        "str_delim": {'"'},
+    },
+    "go": {
+        "ext": {".go", ".gno"},
+        "syn": "go",
+        "def": re.compile(r"func\s+(?:\([^)]+\)\s+)?(\w+)\s*\("),
+        "qcall": re.compile(r"(\w+)\.(\w+)\s*\("),
+        "call": re.compile(r"\b(\w+)\s*\("),
+        "struct": re.compile(r"type\s+(\w+)\s+(?:struct|interface)"),
+        "module": re.compile(r"package\s+(\w+)"),
+        "skip": {"if","else","for","range","switch","case","select","return",
+                 "go","defer","func","type","struct","interface","map","make",
+                 "new","len","cap","append","delete","panic","recover","close",
+                 "copy","print","println","complex","real","imag","true","false",
+                 "nil","error","string","int","int8","int16","int32","int64",
+                 "uint","uint8","uint16","uint32","uint64","float32","float64",
+                 "byte","rune","bool","any","comparable","iota","var","const"},
+        "cmt1": "//", "cmtS": "/*", "cmtE": "*/",
+        "str_delim": {'"', '`'},
+    },
+}
+
+EXCLUDE_DIRS = {"node_modules","target","build","out",".git","vendor","lib",
+                "artifacts","cache","typechain","typechain-types","coverage",
+                "deployments","__pycache__",".next","dist"}
+TEST_DIRS = {"test","tests","test_","_test","testing","fixtures","mocks","mock",
+             "testdata","testutil","testutils"}
+
+# ── Data Structures ──────────────────────────────────────────────────────────
+
+@dataclass
+class FuncDef:
+    name: str
+    file: str
+    line: int
+    sig: str = ""
+    module: str = ""  # enclosing module/contract name
+    is_stub: bool = False  # interface declaration without body
+
+@dataclass
+class CallRef:
+    caller: str       # caller function name
+    callee: str       # callee bare name
+    qualifier: str    # module/contract qualifier (or "")
+    file: str
+    line: int
+    context: str      # the line of code
+
+@dataclass
+class SliceResult:
+    func: FuncDef
+    body: str
+    line_end: int
+    calls: List[str]  # bare callee names found in body
+
+# ── File Scanner ─────────────────────────────────────────────────────────────
+
+def detect_lang(path: str) -> Optional[str]:
+    ext = Path(path).suffix.lower()
+    for name, cfg in LANGS.items():
+        if ext in cfg["ext"]:
+            return name
+    return None
+
+def collect_files(root: str, lang: Optional[str] = None,
+                  include_tests: bool = False) -> List[str]:
+    """Collect source files. Uses ripgrep --files if available, else Python."""
+    extensions = set()
+    if lang and lang in LANGS:
+        extensions = LANGS[lang]["ext"]
+    else:
+        for cfg in LANGS.values():
+            extensions.update(cfg["ext"])
+
+    globs = [f"*.{e.lstrip('.')}" for e in extensions]
+
+    files = []
+    try:
+        cmd = ["rg", "--files", "--no-messages"]
+        for g in globs:
+            cmd += ["-g", g]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=root,
+                                timeout=15)
+        if result.returncode == 0:
+            files = [os.path.join(root, f) for f in result.stdout.strip().split("\n") if f]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Fallback to Python
+        root_path = Path(root)
+        for ext in extensions:
+            files.extend(str(f) for f in root_path.rglob(f"*{ext}"))
+
+    # Filter directories
+    exclude = EXCLUDE_DIRS.copy()
+    if not include_tests:
+        exclude.update(TEST_DIRS)
+
+    def keep(f):
+        parts = set(Path(f).parts)
+        return not parts.intersection(exclude)
+
+    return sorted(f for f in files if keep(f))
+
+# ── Smart Parser ─────────────────────────────────────────────────────────────
+
+class Parser:
+    """Language-aware source code parser."""
+
+    def __init__(self, file_path: str, lang: str):
+        self.file = file_path
+        self.lang = lang
+        self.cfg = LANGS[lang]
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                self.raw_lines = f.readlines()
+        except OSError:
+            self.raw_lines = []
+        self.lines = [l.rstrip("\n\r") for l in self.raw_lines]
+        self._module_name = ""
+
+    @property
+    def module_name(self) -> str:
+        """Extract module/package/contract name from file."""
+        if self._module_name:
+            return self._module_name
+        pat = self.cfg.get("module")
+        if pat:
+            for line in self.lines[:50]:  # module decl is early
+                m = pat.search(line)
+                if m:
+                    self._module_name = m.group(1)
+                    break
+        if not self._module_name:
+            self._module_name = Path(self.file).stem
+        return self._module_name
+
+    def _is_comment_or_string(self, line: str, pos: int) -> bool:
+        """Quick check if position is inside a string literal."""
+        in_str = False
+        str_char = None
+        for i, ch in enumerate(line[:pos]):
+            if not in_str and ch in self.cfg.get("str_delim", {'"'}):
+                in_str = True
+                str_char = ch
+            elif in_str and ch == str_char and (i == 0 or line[i-1] != '\\'):
+                in_str = False
+        return in_str
+
+    def _strip_comment(self, line: str) -> str:
+        """Strip single-line comment from a line, respecting strings."""
+        cmt = self.cfg["cmt1"]
+        in_str = False
+        str_char = None
+        for i, ch in enumerate(line):
+            if not in_str and ch in self.cfg.get("str_delim", {'"'}):
+                in_str = True
+                str_char = ch
+            elif in_str and ch == str_char and (i == 0 or line[i-1] != '\\'):
+                in_str = False
+            elif not in_str and line[i:i+len(cmt)] == cmt:
+                return line[:i]
+        return line
+
+    def _is_interface_stub(self, start_line: int) -> bool:
+        """Check if a function declaration is an interface stub (no body, ends with ;)."""
+        # Scan from the definition line forward to find either { or ;
+        for i in range(start_line - 1, min(start_line + 10, len(self.lines))):
+            line = self._strip_comment(self.lines[i]).strip()
+            if '{' in line:
+                return False
+            if line.endswith(';'):
+                return True
+        return False
+
+    def extract_defs(self) -> List[FuncDef]:
+        """Extract function definitions."""
+        defs = []
+        pat = self.cfg["def"]
+        in_block_comment = False
+        cs, ce = self.cfg["cmtS"], self.cfg["cmtE"]
+
+        for i, line in enumerate(self.lines):
+            # Track block comments
+            if cs in line and ce in line:
+                # Single-line block comment
+                idx_s = line.index(cs)
+                idx_e = line.index(ce, idx_s + len(cs))
+                line = line[:idx_s] + line[idx_e + len(ce):]
+            elif cs in line:
+                in_block_comment = True
+                line = line[:line.index(cs)]
+            elif in_block_comment:
+                if ce in line:
+                    in_block_comment = False
+                    line = line[line.index(ce) + len(ce):]
+                else:
+                    continue
+
+            if in_block_comment:
+                continue
+
+            code = self._strip_comment(line)
+            m = pat.search(code)
+            if m:
+                fname = m.group(1)
+                stub = self._is_interface_stub(i + 1)
+                defs.append(FuncDef(
+                    name=fname,
+                    file=self.file,
+                    line=i + 1,
+                    sig=line.strip(),
+                    module=self.module_name,
+                    is_stub=stub,
+                ))
+        return defs
+
+    def extract_calls(self, defs: List[FuncDef]) -> List[CallRef]:
+        """Extract function call references."""
+        calls = []
+        skip = self.cfg["skip"]
+        qpat = self.cfg.get("qcall")
+        cpat = self.cfg["call"]
+
+        # Build a map: line_number -> enclosing function name
+        # Using simple "last def before this line" heuristic + brace tracking
+        func_ranges = self._build_func_ranges(defs)
+
+        in_block_comment = False
+        cs, ce = self.cfg["cmtS"], self.cfg["cmtE"]
+
+        for i, line in enumerate(self.lines):
+            lineno = i + 1
+
+            # Block comments
+            if cs in line and ce in line:
+                idx_s = line.index(cs)
+                idx_e = line.index(ce, idx_s + len(cs))
+                code = line[:idx_s] + line[idx_e + len(ce):]
+            elif cs in line:
+                in_block_comment = True
+                code = line[:line.index(cs)]
+            elif in_block_comment:
+                if ce in line:
+                    in_block_comment = False
+                    code = line[line.index(ce) + len(ce):]
+                else:
+                    continue
+            else:
+                code = line
+
+            if in_block_comment:
+                continue
+
+            code = self._strip_comment(code)
+
+            # Skip function definition lines themselves
+            if self.cfg["def"].search(code):
+                continue
+
+            # Skip revert/emit lines – these are not real function calls
+            code_stripped = code.strip()
+            if code_stripped.startswith('revert ') or code_stripped.startswith('emit '):
+                continue
+
+            # Determine enclosing function
+            enclosing = self._enclosing_func(lineno, func_ranges)
+
+            # Qualified calls: module::func() or obj.func()
+            seen_positions = set()
+            if qpat:
+                for m in qpat.finditer(code):
+                    qualifier = m.group(1)
+                    callee = m.group(2)
+                    if callee in skip or qualifier in skip:
+                        continue
+                    seen_positions.add(m.start())
+                    # Mark the position of the callee within the match
+                    seen_positions.add(m.start(2))
+                    calls.append(CallRef(
+                        caller=enclosing,
+                        callee=callee,
+                        qualifier=qualifier,
+                        file=self.file,
+                        line=lineno,
+                        context=line.strip(),
+                    ))
+
+            # Bare calls
+            for m in cpat.finditer(code):
+                if m.start() in seen_positions:
+                    continue
+                callee = m.group(1)
+                if callee in skip:
+                    continue
+                # Skip if this is part of a qualified call already captured
+                # Check if there's a :: or . before this match
+                pre = code[:m.start()].rstrip()
+                if pre.endswith("::") or pre.endswith("."):
+                    continue
+                calls.append(CallRef(
+                    caller=enclosing,
+                    callee=callee,
+                    qualifier="",
+                    file=self.file,
+                    line=lineno,
+                    context=line.strip(),
+                ))
+
+        return calls
+
+    def _build_func_ranges(self, defs: List[FuncDef]) -> List[Tuple[int, int, str]]:
+        """Build (start, end, name) ranges for functions using brace counting."""
+        ranges = []
+        for d in defs:
+            end = self._find_body_end(d.line)
+            ranges.append((d.line, end, d.name))
+        return ranges
+
+    def _find_body_end(self, start_line: int) -> int:
+        """Find the closing brace of a function body, aware of strings/comments.
+        Returns start_line for interface stubs (no body)."""
+        # First, check if this is an interface stub (ends with ; before any {)
+        for i in range(start_line - 1, min(start_line + 10, len(self.lines))):
+            stripped = self._strip_comment(self.lines[i]).strip()
+            if '{' in stripped:
+                break  # has a body, proceed normally
+            if stripped.endswith(';'):
+                return i + 1  # stub: return just this line
+
+        depth = 0
+        started = False
+        in_block = False
+        cs, ce = self.cfg["cmtS"], self.cfg["cmtE"]
+
+        for i in range(start_line - 1, len(self.lines)):
+            line = self.lines[i]
+            j = 0
+            in_str = False
+            str_ch = None
+
+            while j < len(line):
+                ch = line[j]
+
+                # Block comment
+                if not in_str and not in_block and line[j:j+len(cs)] == cs:
+                    in_block = True
+                    j += len(cs)
+                    continue
+                if in_block:
+                    if line[j:j+len(ce)] == ce:
+                        in_block = False
+                        j += len(ce)
+                    else:
+                        j += 1
+                    continue
+
+                # Single-line comment
+                if not in_str and line[j:j+len(self.cfg["cmt1"])] == self.cfg["cmt1"]:
+                    break
+
+                # String literals
+                if not in_str and ch in self.cfg.get("str_delim", {'"'}):
+                    in_str = True
+                    str_ch = ch
+                    j += 1
+                    continue
+                if in_str:
+                    if ch == str_ch and (j == 0 or line[j-1] != '\\'):
+                        in_str = False
+                    j += 1
+                    continue
+
+                # Braces
+                if ch == '{':
+                    depth += 1
+                    started = True
+                elif ch == '}':
+                    depth -= 1
+                    if started and depth == 0:
+                        return i + 1
+
+                j += 1
+
+        return min(start_line + 1, len(self.lines))
+
+    def _enclosing_func(self, lineno: int,
+                        ranges: List[Tuple[int, int, str]]) -> str:
+        """Find which function encloses a given line number."""
+        for start, end, name in ranges:
+            if start <= lineno <= end:
+                return name
+        return "<top>"
+
+    def extract_body(self, start_line: int) -> SliceResult:
+        """Extract complete function body with calls list."""
+        end = self._find_body_end(start_line)
+        body_lines = self.lines[start_line - 1 : end]
+        body = "\n".join(body_lines)
+
+        # Extract calls from body
+        calls = []
+        skip = self.cfg["skip"]
+        qpat = self.cfg.get("qcall")
+        cpat = self.cfg["call"]
+
+        for bline in body_lines:
+            code = self._strip_comment(bline)
+            if self.cfg["def"].search(code):
+                continue
+            # Skip revert/emit lines in body too
+            cs = code.strip()
+            if cs.startswith('revert ') or cs.startswith('emit '):
+                continue
+            if qpat:
+                for m in qpat.finditer(code):
+                    c = m.group(2)
+                    if c not in skip and c not in calls:
+                        calls.append(c)
+            for m in cpat.finditer(code):
+                c = m.group(1)
+                pre = code[:m.start()].rstrip()
+                if pre.endswith("::") or pre.endswith("."):
+                    continue
+                if c not in skip and c not in calls:
+                    calls.append(c)
+
+        return SliceResult(
+            func=FuncDef(name="", file=self.file, line=start_line),
+            body=body,
+            line_end=end,
+            calls=calls,
+        )
+
+    def extract_structs(self) -> List[Tuple[str, int, str]]:
+        """Extract struct/type definitions: (name, line, body)."""
+        pat = self.cfg.get("struct")
+        if not pat:
+            return []
+        results = []
+        in_block = False
+        cs, ce = self.cfg["cmtS"], self.cfg["cmtE"]
+        for i, line in enumerate(self.lines):
+            if cs in line:
+                in_block = True
+            if ce in line:
+                in_block = False
+                continue
+            if in_block:
+                continue
+            code = self._strip_comment(line)
+            m = pat.search(code)
+            if m:
+                name = m.group(1)
+                end = self._find_body_end(i + 1)
+                body = "\n".join(self.lines[i:end])
+                results.append((name, i + 1, body))
+        return results
+
+# ── Call Graph ───────────────────────────────────────────────────────────────
+
+class CallGraph:
+    """Aggregates definitions and call references across files."""
+
+    def __init__(self):
+        self.defs: List[FuncDef] = []
+        self.calls: List[CallRef] = []
+        self.file_cache: Dict[str, Parser] = {}
+        # module_name -> file_path mapping
+        self.modules: Dict[str, str] = {}
+
+    def add_file(self, path: str, lang: str):
+        p = Parser(path, lang)
+        self.file_cache[path] = p
+        self.modules[p.module_name] = path
+
+        defs = p.extract_defs()
+        self.defs.extend(defs)
+
+        calls = p.extract_calls(defs)
+        self.calls.extend(calls)
+
+    def find_defs(self, name: str, exact: bool = False) -> List[FuncDef]:
+        if exact:
+            return [d for d in self.defs if d.name == name]
+        nl = name.lower()
+        return [d for d in self.defs if nl in d.name.lower()]
+
+    def find_callers(self, name: str, exact: bool = False) -> List[CallRef]:
+        """Find calls TO this function (including qualified calls)."""
+        results = []
+        for c in self.calls:
+            if exact:
+                if c.callee == name:
+                    results.append(c)
+            else:
+                if name.lower() in c.callee.lower():
+                    results.append(c)
+        # Deduplicate by (file, line, callee)
+        seen = set()
+        deduped = []
+        for c in results:
+            key = (c.file, c.line, c.callee)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        return deduped
+
+    def find_callees(self, name: str, exact: bool = False) -> List[CallRef]:
+        """Find calls FROM this function."""
+        results = []
+        for c in self.calls:
+            if exact:
+                if c.caller == name:
+                    results.append(c)
+            else:
+                if name.lower() in c.caller.lower():
+                    results.append(c)
+        seen = set()
+        deduped = []
+        for c in results:
+            key = (c.file, c.line, c.callee)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        return deduped
+
+    def get_parser(self, path: str) -> Optional[Parser]:
+        return self.file_cache.get(path)
+
+# ── Super Slicer ─────────────────────────────────────────────────────────────
+
+class Slicer:
+    """Generate complete function slices with dependencies."""
+
+    def __init__(self, graph: CallGraph):
+        self.graph = graph
+        self.sliced: Dict[str, Tuple[str, SliceResult, str]] = {}  # name -> (lang, result, file)
+
+    @staticmethod
+    def _pick_best_def(defs: List[FuncDef]) -> FuncDef:
+        """Prefer implementation (has body) over interface stub."""
+        impls = [d for d in defs if not d.is_stub]
+        if impls:
+            return impls[0]
+        return defs[0]
+
+    def slice(self, name: str) -> Optional[str]:
+        target_defs = self.graph.find_defs(name, exact=True)
+        if not target_defs:
+            target_defs = self.graph.find_defs(name, exact=False)
+        if not target_defs:
+            return None
+
+        target = self._pick_best_def(target_defs)
+        lang = detect_lang(target.file) or "move"
+        syn = LANGS[lang]["syn"]
+        parser = self.graph.get_parser(target.file)
+        if not parser:
+            return None
+
+        # Extract main function body
+        main = parser.extract_body(target.line)
+        main.func = target
+        self.sliced[name] = (lang, main, target.file)
+
+        # Recursively resolve called functions (depth-limited)
+        visited = {name}
+        frontier = list(main.calls)
+        for _ in range(3):  # max depth
+            next_frontier = []
+            for callee in frontier:
+                if callee in visited:
+                    continue
+                visited.add(callee)
+                cdefs = self.graph.find_defs(callee, exact=True)
+                if cdefs:
+                    cd = self._pick_best_def(cdefs)
+                    clang = detect_lang(cd.file) or lang
+                    cp = self.graph.get_parser(cd.file)
+                    if cp:
+                        cs = cp.extract_body(cd.line)
+                        cs.func = cd
+                        self.sliced[callee] = (clang, cs, cd.file)
+                        next_frontier.extend(c for c in cs.calls if c not in visited)
+            frontier = next_frontier
+
+        # Find callers
+        callers = self.graph.find_callers(name, exact=True)
+
+        # Find types in the same file
+        types = parser.extract_structs()
+
+        return self._render(target, main, callers, types, syn)
+
+    def _render(self, target: FuncDef, main: SliceResult,
+                callers: List[CallRef],
+                types: List[Tuple[str, int, str]],
+                syn: str) -> str:
+        cwd = os.getcwd()
+        rel = os.path.relpath(target.file, cwd)
+
+        # Criticality
+        crit_kw = {'transfer','withdraw','deposit','send','mint','burn',
+                    'approve','set','update','delete','remove','add','admin',
+                    'owner','swap','liquidat','borrow','repay','stake','claim'}
+        is_crit = any(k in target.name.lower() for k in crit_kw)
+        crit_label = "🔴 CRITICAL" if is_crit else "🟢 NORMAL"
+
+        called = {k: v for k, v in self.sliced.items() if k != target.name}
+
+        # Extract access modifiers from signature
+        sig_lower = target.sig.lower()
+        access_tags = []
+        for kw in ['onlyOwner', 'requiresAuth', 'onlyRole', 'onlyAdmin',
+                    'whenNotPaused', 'nonReentrant', 'isAllowed']:
+            if kw.lower() in sig_lower:
+                access_tags.append(kw)
+        access_str = ', '.join(f'`{t}`' for t in access_tags) if access_tags else '`public` (no restrictions)'
+
+        md = []
+        md.append(f"# 🎯 SUPER SLICE: `{target.name}()`\n")
+        md.append(f"| | |")
+        md.append(f"|---|---|")
+        md.append(f"| **File** | `{rel}` |")
+        md.append(f"| **Lines** | {target.line}–{main.line_end} |")
+        if target.module:
+            md.append(f"| **Contract** | `{target.module}` |")
+        md.append(f"| **Access** | {access_str} |")
+        md.append(f"| **Criticality** | {crit_label} |")
+        md.append("")
+
+        # ── TL;DR ──
+        md.append("## 📋 TL;DR\n")
+        caller_names = list(set(c.caller for c in callers))
+        callee_names = list(main.calls[:10])
+        tldr_parts = [f"`{target.name}()` is defined in `{target.module}`."]
+        if caller_names:
+            caller_str = ', '.join(f'`{c}()`' for c in caller_names[:5])
+            tldr_parts.append(f"Called by: {caller_str}.")
+        else:
+            tldr_parts.append("No callers found (entry point or dead code).")
+        if callee_names:
+            callee_str = ', '.join(f'`{c}()`' for c in callee_names[:5])
+            tldr_parts.append(f"Internally calls: {callee_str}.")
+        if access_tags:
+            tldr_parts.append(f"Restricted by: {', '.join(access_tags)}.")
+        md.append(' '.join(tldr_parts))
+        md.append("")
+
+        # ── Call Graph ──
+        md.append("## 🔗 Call Graph\n")
+        md.append("```")
+        # Callers → target
+        if callers:
+            max_caller_len = max(len(c.caller) + 2 for c in callers)  # +2 for ()
+            for c in callers[:10]:
+                pad = ' ' * (max_caller_len - len(c.caller) - 2)
+                crel = os.path.relpath(c.file, cwd)
+                md.append(f"  {c.caller}(){pad}  ──▶  {target.name}()       [{crel}:{c.line}]")
+        else:
+            md.append(f"  (no callers)   ──▶  {target.name}()")
+        # target → callees
+        if callee_names:
+            md.append(f"  {'':>{len(target.name)+2}}       │")
+            for i, callee in enumerate(callee_names[:10]):
+                connector = "└──▶" if i == len(callee_names[:10]) - 1 else "├──▶"
+                # Find source file for this callee if available
+                callee_loc = ""
+                if callee in called:
+                    _, cresult, cpath = called[callee]
+                    callee_loc = f"  [{os.path.relpath(cpath, cwd)}:{cresult.func.line}]"
+                md.append(f"  {'':>{len(target.name)+2}}       {connector}  {callee}(){callee_loc}")
+        md.append("```")
+        md.append("")
+
+        # ── Entry Point Code ──
+        md.append(f"## 🎯 Source: `{target.name}()`\n")
+        body_lines = main.body.split('\n')
+        numbered = []
+        for i, bline in enumerate(body_lines):
+            lineno = target.line + i
+            numbered.append(f"{lineno:>4} │ {bline}")
+        md.append(f"```{syn}")
+        md.append('\n'.join(numbered))
+        md.append("```\n")
+
+        # ── Callers Detail ──
+        if callers:
+            md.append(f"## 📥 Callers ({len(callers)})\n")
+            # Group by file
+            callers_by_file: Dict[str, List[CallRef]] = defaultdict(list)
+            for c in callers:
+                callers_by_file[c.file].append(c)
+            for fpath, fcallers in callers_by_file.items():
+                frel = os.path.relpath(fpath, cwd)
+                md.append(f"**`{frel}`**")
+                for c in fcallers[:15]:
+                    q = f"{c.qualifier}." if c.qualifier else ""
+                    md.append(f"- `{c.caller}()` → `{q}{c.callee}()` at L{c.line}")
+                    md.append(f"  ```{syn}")
+                    md.append(f"  {c.context[:120]}")
+                    md.append(f"  ```")
+                md.append("")
+            if len(callers) > 15:
+                md.append(f"*...and {len(callers) - 15} more*\n")
+
+        # ── Called Functions (Dependencies) ──
+        if called:
+            md.append(f"## 📞 Dependencies ({len(called)})\n")
+            for fname, (flang, result, fpath) in list(called.items())[:15]:
+                frel = os.path.relpath(fpath, cwd)
+                fsyn = LANGS.get(flang, {}).get("syn", syn)
+                md.append(f"### `{fname}()` — `{frel}:{result.func.line}`\n")
+                blines = result.body.split("\n")
+                numbered_dep = []
+                for i, bline in enumerate(blines[:30]):
+                    lineno = result.func.line + i
+                    numbered_dep.append(f"{lineno:>4} │ {bline}")
+                md.append(f"```{fsyn}")
+                md.append('\n'.join(numbered_dep))
+                if len(blines) > 30:
+                    md.append(f"     │ // ... {len(blines) - 30} more lines ...")
+                md.append("```\n")
+            if len(called) > 15:
+                md.append(f"*...and {len(called) - 15} more*\n")
+
+        # ── Types ──
+        if types:
+            md.append(f"## 📦 Types ({len(types)})\n")
+            for tname, tline, tbody in types[:8]:
+                md.append(f"### `{tname}` (L{tline})")
+                md.append(f"```{syn}")
+                tlines = tbody.split("\n")
+                if len(tlines) > 15:
+                    md.append("\n".join(tlines[:12]))
+                    md.append("// ...")
+                else:
+                    md.append(tbody)
+                md.append("```\n")
+
+        # ── Security Notes ──
+        md.append("## 🔒 Security Notes\n")
+        body_l = main.body.lower()
+        hints = []
+        if is_crit:
+            hints.append("🔴 **Critical function** – handles funds/state changes")
+        if 'abort' in body_l or 'assert' in body_l or 'require' in body_l or 'revert' in body_l:
+            hints.append("✅ Has validation / abort checks")
+        if len(callers) == 0:
+            hints.append("⚠️ No callers found – may be entry point or dead code")
+        if len(main.calls) > 10:
+            hints.append(f"⚠️ High complexity – {len(main.calls)} direct calls")
+        if target.is_stub:
+            hints.append("⚠️ Interface stub – no implementation found in scope")
+        if not hints:
+            hints.append("🟢 No obvious flags")
+        for h in hints:
+            md.append(f"- {h}")
+        md.append("")
+
+        md.append("---")
+        md.append("*Generated by gfunc v2 --slice*")
+        return "\n".join(md)
+
+# ── Output Formatting ────────────────────────────────────────────────────────
+
+def fmt_loc(file: str, line: int) -> str:
+    try:
+        rel = os.path.relpath(file)
+    except ValueError:
+        rel = file
+    return f"{C.CYN}{rel}{C.RST}:{C.YEL}{line}{C.RST}"
+
+def print_def(d: FuncDef):
+    print(f"  {C.GRN}def{C.RST} {C.B}{d.name}{C.RST}")
+    print(f"      {fmt_loc(d.file, d.line)}")
+    sig = d.sig[:90]
+    if len(d.sig) > 90:
+        sig += "..."
+    print(f"      {C.GRY}{sig}{C.RST}")
+
+def print_call(c: CallRef, show_caller: bool = True):
+    q = f"{c.qualifier}::" if c.qualifier else ""
+    if show_caller:
+        print(f"  {C.MAG}{c.caller}{C.RST} → {C.B}{q}{c.callee}{C.RST}()")
+    else:
+        print(f"  {C.B}{q}{c.callee}{C.RST}()")
+    print(f"      {fmt_loc(c.file, c.line)}")
+    ctx = c.context[:110]
+    if len(c.context) > 110:
+        ctx += "..."
+    print(f"      {C.GRY}{ctx}{C.RST}")
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="gfunc",
+        description="gfunc v2 – Universal Function Call Graph Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  gfunc deposit src/                # Find definitions + callers
+  gfunc transfer . --exact          # Exact match
+  gfunc --callers-of swap .         # Who calls swap
+  gfunc --callees-of main .         # What main calls
+  gfunc --xrefs withdraw .          # Callers + callees
+  gfunc --slice mint .              # Full slice with deps
+  gfunc --slice mint -o slices/     # Save slice to file
+  gfunc withdraw --lang move        # Force Move language
+  gfunc --json deposit .            # JSON output
+""",
+    )
+    ap.add_argument("function", nargs="?", help="Function name to search")
+    ap.add_argument("path", nargs="?", default=".", help="Search path (default: .)")
+    ap.add_argument("--lang", "-l", choices=list(LANGS) + ["auto"], default="auto")
+    ap.add_argument("--exact", "-e", action="store_true", help="Exact name match")
+    ap.add_argument("--callers-of", metavar="FUNC")
+    ap.add_argument("--callees-of", metavar="FUNC")
+    ap.add_argument("--xrefs", metavar="FUNC", help="Show callers + callees")
+    ap.add_argument("--slice", "-s", metavar="FUNC", help="Generate super slice")
+    ap.add_argument("-o", "--output", metavar="DIR", help="Output dir for slice")
+    ap.add_argument("--defs-only", "-d", action="store_true")
+    ap.add_argument("--calls-only", "-c", action="store_true")
+    ap.add_argument("--json", "-j", action="store_true", help="JSON output")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--include-tests", "-t", action="store_true")
+
+    args = ap.parse_args()
+
+    # Determine mode + target
+    if args.slice:
+        target, mode = args.slice, "slice"
+    elif args.xrefs:
+        target, mode = args.xrefs, "xrefs"
+    elif args.callers_of:
+        target, mode = args.callers_of, "callers"
+    elif args.callees_of:
+        target, mode = args.callees_of, "callees"
+    elif args.function:
+        target, mode = args.function, "all"
+    else:
+        ap.print_help()
+        sys.exit(1)
+
+    if args.no_color:
+        C.off()
+
+    lang = None if args.lang == "auto" else args.lang
+
+    # Collect + parse files
+    print(f"{C.GRY}Scanning...{C.RST}", file=sys.stderr, end="", flush=True)
+    files = collect_files(args.path, lang, args.include_tests)
+    print(f" {len(files)} files", file=sys.stderr, end="", flush=True)
+
+    graph = CallGraph()
+    for f in files:
+        fl = lang or detect_lang(f)
+        if fl:
+            graph.add_file(f, fl)
+    print(f", {len(graph.defs)} functions indexed{C.RST}", file=sys.stderr)
+
+    # ── Slice mode ──
+    if mode == "slice":
+        slicer = Slicer(graph)
+        md = slicer.slice(target)
+        if md:
+            if args.output:
+                os.makedirs(args.output, exist_ok=True)
+                out = os.path.join(args.output, f"{target}_SLICE.md")
+                with open(out, "w") as f:
+                    f.write(md)
+                print(f"{C.GRN}✅ Saved: {out}{C.RST}")
+            else:
+                print(md)
+        else:
+            print(f"{C.YEL}No function found matching '{target}'{C.RST}")
+        return
+
+    # ── Graph search modes ──
+    defs = graph.find_defs(target, args.exact)
+    callers = graph.find_callers(target, args.exact) if mode in ("all", "callers", "xrefs") else []
+    callees = graph.find_callees(target, args.exact) if mode in ("callees", "xrefs") else []
+
+    if args.json:
+        out = {
+            "function": target,
+            "definitions": [{"name": d.name, "file": d.file, "line": d.line,
+                             "signature": d.sig, "module": d.module} for d in defs],
+            "callers": [{"caller": c.caller, "callee": c.callee,
+                         "qualifier": c.qualifier, "file": c.file,
+                         "line": c.line, "context": c.context} for c in callers],
+            "callees": [{"caller": c.caller, "callee": c.callee,
+                         "qualifier": c.qualifier, "file": c.file,
+                         "line": c.line, "context": c.context} for c in callees],
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    found = False
+
+    # Definitions
+    if not args.calls_only and defs:
+        print(f"\n{C.B}═══ DEFINITIONS ({len(defs)}) ═══{C.RST}")
+        for d in sorted(defs, key=lambda x: (x.file, x.line)):
+            print_def(d)
+            print()
+        found = True
+
+    # Callers
+    if not args.defs_only and callers:
+        print(f"\n{C.B}═══ CALLERS ({len(callers)}) ═══{C.RST}")
+        for c in sorted(callers, key=lambda x: (x.file, x.line)):
+            print_call(c, show_caller=True)
+            print()
+        found = True
+
+    # Callees
+    if not args.defs_only and callees:
+        print(f"\n{C.B}═══ CALLEES ({len(callees)}) ═══{C.RST}")
+        for c in sorted(callees, key=lambda x: (x.file, x.line)):
+            print_call(c, show_caller=False)
+            print()
+        found = True
+
+    # Summary
+    if found:
+        parts = []
+        if defs:
+            parts.append(f"{len(defs)} defs")
+        if callers:
+            parts.append(f"{len(callers)} callers")
+        if callees:
+            parts.append(f"{len(callees)} callees")
+        print(f"{C.GRY}Found: {', '.join(parts)}{C.RST}")
+    else:
+        print(f"{C.YEL}No results for '{target}'{C.RST}")
+
+
+if __name__ == "__main__":
+    main()
