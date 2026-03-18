@@ -221,3 +221,8 @@ done
 ## License
 
 MIT License — see [LICENSE](LICENSE)
+
+
+
+
+curl -s --max-time 10 "https://1.1.1.1/dns-query?name=idos.network&type=A" -H "accept: application/dns-json" | python3 -m json.tool 2>/dev/null
