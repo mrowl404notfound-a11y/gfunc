@@ -208,7 +208,7 @@ gfunc --slice withdraw -o audit_slices/
 gfunc transfer .          # Find all transfer-related functions
 gfunc --xrefs deposit .   # See full context of deposit
 ```
-
+owl
 ### Bug Hunting
 
 ```bash
