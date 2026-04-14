@@ -9,7 +9,7 @@ Uses ripgrep for speed + smart parsing for accuracy. Properly handles `module::f
 
 ---
 
-## Features
+## Featuress
 
 - **Multi-language** — Solidity, Rust, Move, Go (auto-detected)
 - **Call graph analysis** — Find callers, callees, and cross-references
